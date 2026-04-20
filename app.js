@@ -147,14 +147,54 @@ function parseGeo(data) {
   toast(`✅ ${S.allMeshes.length} cubos carregados`);
 }
 
+// Expand Bedrock "box UV" (single [u,v] offset) into per-face UV rects.
+// Standard Bedrock layout (no mirror):
+//   [  UP (W×D)  ][  DOWN (W×D)  ]
+//   [ W (D×H) ][ N (W×H) ][ E (D×H) ][ S (W×H) ]
+// With mirror=true, east/west swap.
+function expandBoxUv(cube) {
+  const uv = cube.uv;
+  if (!uv) return {};
+  if (!Array.isArray(uv)) return uv; // already per-face
+
+  const [u, v] = uv;
+  const [W, H, D] = cube.size || [1, 1, 1];
+  // NOTE: UV uses the UN-inflated cube size (that's how Blockbench/Bedrock behave).
+  //
+  // For UP/DOWN faces in box UV, Bedrock's "unfolded net" convention places
+  // the -Z (north) edge at the BOTTOM of the UP rect and at the TOP of the DOWN rect.
+  // Per-face UV would put -Z at the top. To re-use the same BoxGeometry vertex→UV
+  // mapping, we emit NEGATIVE V sizes on UP (and positive on DOWN, flipped on U
+  // via the offset) so the rendered face ends up oriented correctly.
+  //
+  // Layout (no mirror):
+  //   [  UP (W×D)  ][  DOWN (W×D)  ]
+  //   [ W(D×H) ][ N(W×H) ][ E(D×H) ][ S(W×H) ]
+  const out = {};
+  if (cube.mirror === true) {
+    // Mirrored: east/west swap + UP/DOWN flipped horizontally
+    out.up    = { uv: [u + D + W,     v + D],   uv_size: [-W, -D] };
+    out.down  = { uv: [u + D + 2 * W, v],       uv_size: [-W,  D] };
+    out.east  = { uv: [u,             v + D],   uv_size: [D, H] };
+    out.north = { uv: [u + D,         v + D],   uv_size: [W, H] };
+    out.west  = { uv: [u + D + W,     v + D],   uv_size: [D, H] };
+    out.south = { uv: [u + 2 * D + W, v + D],   uv_size: [W, H] };
+  } else {
+    out.up    = { uv: [u + D,         v + D],   uv_size: [ W, -D] }; // -Z at bottom of rect
+    out.down  = { uv: [u + D + 2 * W, v],       uv_size: [-W,  D] }; // rotated 180° vs UP
+    out.west  = { uv: [u,             v + D],   uv_size: [D, H] };
+    out.north = { uv: [u + D,         v + D],   uv_size: [W, H] };
+    out.east  = { uv: [u + D + W,     v + D],   uv_size: [D, H] };
+    out.south = { uv: [u + 2 * D + W, v + D],   uv_size: [W, H] };
+  }
+  return out;
+}
+
 function computeUvRects() {
   const rects = [];
   (S.geo.bones || []).forEach((bone, bi) => {
     (bone.cubes || []).forEach((cube, ci) => {
-      const uvMap = cube.uv || {};
-      // Box-style UV (single offset, all 6 faces auto-laid-out) is not handled here;
-      // we focus on per-face uv used by Bedrock weapon models.
-      if (Array.isArray(uvMap)) return;
+      const uvMap = expandBoxUv(cube);
       Object.entries(uvMap).forEach(([face, fd]) => {
         if (!fd || !fd.uv) return;
         const [ux, uy] = fd.uv;
@@ -196,11 +236,12 @@ function buildModel() {
   S.allMeshes = [];
   S.meshGroup = new THREE.Group();
 
-  // Build pivots map (Bedrock → Three.js: negate X)
+  // Build pivots map — Bedrock and Three.js are both right-handed with +Y up,
+  // so we use coordinates directly (NO X flip).
   const pivotOf = {};
   (S.geo.bones || []).forEach(bone => {
     const p = bone.pivot || [0, 0, 0];
-    pivotOf[bone.name] = [-p[0] * SCALE, p[1] * SCALE, p[2] * SCALE];
+    pivotOf[bone.name] = [p[0] * SCALE, p[1] * SCALE, p[2] * SCALE];
   });
 
   // Bone groups
@@ -216,10 +257,11 @@ function buildModel() {
       g.position.set(myPiv[0], myPiv[1], myPiv[2]);
     }
     if (bone.rotation) {
+      // Bedrock/Blockbench apply rotations as intrinsic ZYX (Z first, then Y, then X).
       g.rotation.set(
         THREE.MathUtils.degToRad(bone.rotation[0]),
-        THREE.MathUtils.degToRad(-bone.rotation[1]),
-        THREE.MathUtils.degToRad(-bone.rotation[2]),
+        THREE.MathUtils.degToRad(bone.rotation[1]),
+        THREE.MathUtils.degToRad(bone.rotation[2]),
         'ZYX'
       );
     }
@@ -257,16 +299,19 @@ function buildModel() {
       const rh = (sy + inf * 2) * SCALE;
       const rd = (sz + inf * 2) * SCALE;
 
-      const geom = buildCubeGeometry(rw, rh, rd, cube.uv || {}, S.texW, S.texH);
+      const uvMap = expandBoxUv(cube);
+      const geom = buildCubeGeometry(rw, rh, rd, uvMap, S.texW, S.texH);
       const mesh = new THREE.Mesh(geom, sharedMat);
 
-      const cx = -(ox + sx / 2) * SCALE;
+      // Cube center in Bedrock coords (no X flip). Inflate expands symmetrically
+      // so the center stays at (origin + size/2).
+      const cx = (ox + sx / 2) * SCALE;
       const cy = (oy + sy / 2) * SCALE;
       const cz = (oz + sz / 2) * SCALE;
 
       if (cube.rotation) {
         const p = cube.pivot || [0, 0, 0];
-        const px = -p[0] * SCALE;
+        const px = p[0] * SCALE;
         const py = p[1] * SCALE;
         const pz = p[2] * SCALE;
 
@@ -274,8 +319,8 @@ function buildModel() {
         pivGrp.position.set(px - myPiv[0], py - myPiv[1], pz - myPiv[2]);
         pivGrp.rotation.set(
           THREE.MathUtils.degToRad(cube.rotation[0]),
-          THREE.MathUtils.degToRad(-cube.rotation[1]),
-          THREE.MathUtils.degToRad(-cube.rotation[2]),
+          THREE.MathUtils.degToRad(cube.rotation[1]),
+          THREE.MathUtils.degToRad(cube.rotation[2]),
           'ZYX'
         );
         mesh.position.set(cx - px, cy - py, cz - pz);
@@ -564,7 +609,7 @@ function autoFitSticker(mode) {
   $('sl-scale').value = 1;
   $('val-scale').textContent = '1.00';
   $('sl-rot').value = 0;
-  $('val-rot').textContent = '0°';
+  $('val-rot').textContent = '0��';
   $('sl-opacity').value = 1;
   $('val-opacity').textContent = '100%';
 }
