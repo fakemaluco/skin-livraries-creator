@@ -259,32 +259,31 @@ function parseGeo(data) {
   toast(`${S.allMeshes.length} cubos carregados`);
 }
 
-// Expand Bedrock/Java "box UV" (single [u,v] offset) into per-face UV rects.
-// Layout (no mirror):
-//   [  UP (W×D)  ][  DOWN (W×D)  ]
-//   [ W (D×H) ][ N (W×H) ][ E (D×H) ][ S (W×H) ]
+// Expand Bedrock/Java "box UV" (single [u,v] offset) into per-face UV rects,
+// always using POSITIVE uv_size. Orientation handling happens in the cube
+// geometry builder (per-face TL/TR/BL/BR vertex assignment).
+//
+// Layout on the atlas (no mirror):
+//   y=v            [  UP (W×D)   ][  DOWN (W×D)  ]
+//   y=v+D  [WEST(D×H)][NORTH(W×H)][ EAST(D×H)  ][ SOUTH(W×H) ]
 function expandBoxUv(cube) {
   const uv = cube.uv;
   if (!uv) return {};
-  if (!Array.isArray(uv)) return uv;
+  if (!Array.isArray(uv)) return uv; // already per-face
 
   const [u, v] = uv;
   const [W, H, D] = cube.size || [1, 1, 1];
-  const out = {};
+  const out = {
+    up:    { uv: [u + D,         v],         uv_size: [W, D] },
+    down:  { uv: [u + D + W,     v],         uv_size: [W, D] },
+    west:  { uv: [u,             v + D],     uv_size: [D, H] },
+    north: { uv: [u + D,         v + D],     uv_size: [W, H] },
+    east:  { uv: [u + D + W,     v + D],     uv_size: [D, H] },
+    south: { uv: [u + 2 * D + W, v + D],     uv_size: [W, H] },
+  };
   if (cube.mirror === true) {
-    out.up    = { uv: [u + D + W,     v + D],   uv_size: [-W, -D] };
-    out.down  = { uv: [u + D + 2 * W, v],       uv_size: [-W,  D] };
-    out.east  = { uv: [u,             v + D],   uv_size: [D, H] };
-    out.north = { uv: [u + D,         v + D],   uv_size: [W, H] };
-    out.west  = { uv: [u + D + W,     v + D],   uv_size: [D, H] };
-    out.south = { uv: [u + 2 * D + W, v + D],   uv_size: [W, H] };
-  } else {
-    out.up    = { uv: [u + D,         v + D],   uv_size: [ W, -D] };
-    out.down  = { uv: [u + D + 2 * W, v],       uv_size: [-W,  D] };
-    out.west  = { uv: [u,             v + D],   uv_size: [D, H] };
-    out.north = { uv: [u + D,         v + D],   uv_size: [W, H] };
-    out.east  = { uv: [u + D + W,     v + D],   uv_size: [D, H] };
-    out.south = { uv: [u + 2 * D + W, v + D],   uv_size: [W, H] };
+    // Mirrored cubes: swap east/west textures (the common convention)
+    const e = out.east; out.east = out.west; out.west = e;
   }
   return out;
 }
@@ -454,37 +453,82 @@ function buildModel() {
   resetCam();
 }
 
+// Build a cube with explicit per-face vertices, normals, and UVs.
+// Each face stores 4 vertices ordered TL, TR, BL, BR in atlas space, with the
+// spatial-to-atlas mapping following Blockbench/Bedrock conventions:
+//
+//   NORTH (-Z, seen from -Z): U+ -> +X, V+ -> -Y
+//   SOUTH (+Z, seen from +Z): U+ -> -X, V+ -> -Y
+//   EAST  (+X, seen from +X): U+ -> -Z, V+ -> -Y
+//   WEST  (-X, seen from -X): U+ -> +Z, V+ -> -Y
+//   UP    (+Y, looking down): U+ -> +X, V+ -> -Z  (bottom-of-atlas edge meets NORTH top)
+//   DOWN  (-Y, looking down): U+ -> +X, V+ -> +Z  (DOWN flipped vs UP in Z)
 function buildCubeGeometry(w, h, d, uvMap, texW, texH) {
-  const geom = new THREE.BoxGeometry(w, h, d);
-  const uvs = geom.attributes.uv;
+  const hx = w / 2, hy = h / 2, hz = d / 2;
 
-  // Three BoxGeometry face order: +x, -x, +y, -y, +z, -z
-  const faces = ['east', 'west', 'up', 'down', 'south', 'north'];
+  // For each face: 4 vertices ordered [TL, TR, BL, BR] of the atlas rect.
+  const FACE_VERTS = {
+    east:  [[ hx,  hy,  hz], [ hx,  hy, -hz], [ hx, -hy,  hz], [ hx, -hy, -hz]],
+    west:  [[-hx,  hy, -hz], [-hx,  hy,  hz], [-hx, -hy, -hz], [-hx, -hy,  hz]],
+    up:    [[-hx,  hy,  hz], [ hx,  hy,  hz], [-hx,  hy, -hz], [ hx,  hy, -hz]],
+    down:  [[-hx, -hy, -hz], [ hx, -hy, -hz], [-hx, -hy,  hz], [ hx, -hy,  hz]],
+    south: [[ hx,  hy,  hz], [-hx,  hy,  hz], [ hx, -hy,  hz], [-hx, -hy,  hz]],
+    north: [[-hx,  hy, -hz], [ hx,  hy, -hz], [-hx, -hy, -hz], [ hx, -hy, -hz]],
+  };
+  const FACE_NORMAL = {
+    east:  [1, 0, 0],
+    west:  [-1, 0, 0],
+    up:    [0, 1, 0],
+    down:  [0, -1, 0],
+    south: [0, 0, 1],
+    north: [0, 0, -1],
+  };
 
-  for (let i = 0; i < 6; i++) {
-    const face = faces[i];
-    const base = i * 4;
+  const order = ['east', 'west', 'up', 'down', 'south', 'north'];
+  const positions = [];
+  const normals = [];
+  const uvs = [];
+  const indices = [];
+
+  order.forEach((face, fi) => {
+    const verts = FACE_VERTS[face];
+    const nrm = FACE_NORMAL[face];
+    verts.forEach(p => positions.push(p[0], p[1], p[2]));
+    for (let j = 0; j < 4; j++) normals.push(nrm[0], nrm[1], nrm[2]);
+
     const fd = uvMap[face];
-
     if (!fd || !fd.uv) {
-      for (let j = 0; j < 4; j++) uvs.setXY(base + j, 0, 0);
-      continue;
+      for (let j = 0; j < 4; j++) uvs.push(0, 0);
+    } else {
+      const [ux, uy] = fd.uv;
+      const [uw, uh] = fd.uv_size || [0, 0];
+      // Normalize (handle possibly-negative sizes that might still leak in).
+      const x0 = Math.min(ux, ux + uw);
+      const x1 = Math.max(ux, ux + uw);
+      const y0 = Math.min(uy, uy + uh);
+      const y1 = Math.max(uy, uy + uh);
+      const uL = x0 / texW;
+      const uR = x1 / texW;
+      const vTop = 1 - y0 / texH;   // atlas top  (v larger)
+      const vBot = 1 - y1 / texH;   // atlas base (v smaller)
+      // TL, TR, BL, BR
+      uvs.push(uL, vTop);
+      uvs.push(uR, vTop);
+      uvs.push(uL, vBot);
+      uvs.push(uR, vBot);
     }
 
-    const [ux, uy] = fd.uv;
-    const [uw, uh] = fd.uv_size || [1, 1];
+    // CCW triangles viewed from outside the cube:  TL -> BL -> BR, TL -> BR -> TR
+    const base = fi * 4;
+    indices.push(base + 0, base + 2, base + 3);
+    indices.push(base + 0, base + 3, base + 1);
+  });
 
-    const uL = ux / texW;
-    const uR = (ux + uw) / texW;
-    const vT = 1 - (uy / texH);
-    const vB = 1 - ((uy + uh) / texH);
-
-    uvs.setXY(base + 0, uL, vT);
-    uvs.setXY(base + 1, uR, vT);
-    uvs.setXY(base + 2, uL, vB);
-    uvs.setXY(base + 3, uR, vB);
-  }
-  uvs.needsUpdate = true;
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geom.setAttribute('normal',   new THREE.Float32BufferAttribute(normals,   3));
+  geom.setAttribute('uv',       new THREE.Float32BufferAttribute(uvs,       2));
+  geom.setIndex(indices);
   return geom;
 }
 
