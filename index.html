@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>CS:Craft Skin Maker — Projeção 3D</title>
+  <title>CS:Craft Skin Maker — UV Sticker</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"/>
   <link rel="stylesheet" href="style.css"/>
 </head>
@@ -19,7 +19,7 @@
     <span class="logo-sub">Skin Maker</span>
   </div>
   <div class="header-center" id="header-info"></div>
-  <div class="header-badge">Projeção Live ⚡</div>
+  <div class="header-badge">UV Sticker ⚡</div>
 </header>
 
 <div class="app">
@@ -34,25 +34,26 @@
       <input type="file" id="inp-json" accept=".json" hidden/>
     </div>
 
-    <div class="panel">
+    <div class="panel" id="panel-image" style="display:none">
       <div class="panel-header">02 · Imagem da Skin</div>
       <div class="upload-btn" id="btn-img">
         <span class="upload-icon">🎨</span>
-        <span class="upload-text" id="img-text">Arraste a textura</span>
+        <span class="upload-text" id="img-text">Escolher imagem</span>
       </div>
       <input type="file" id="inp-img" accept="image/*" hidden/>
       <div class="img-preview" id="img-preview" style="display:none">
-        <img id="img-thumb" src=""/>
+        <img id="img-thumb" src="" alt=""/>
       </div>
+      <div class="hint">Dica: também dá pra arrastar a imagem direto no atlas UV abaixo.</div>
     </div>
 
     <div class="panel" id="panel-transform" style="display:none">
-      <div class="panel-header">03 · Ajustar Projeção</div>
-      
+      <div class="panel-header">03 · Ajustar Sticker</div>
+
       <div class="slider-row">
         <label>Escala</label>
         <input type="range" id="sl-scale" min="0.05" max="5" step="0.01" value="1"/>
-        <span class="sl-val" id="val-scale">1.0</span>
+        <span class="sl-val" id="val-scale">1.00</span>
       </div>
       <div class="slider-row">
         <label>Rotação</label>
@@ -65,60 +66,47 @@
         <span class="sl-val" id="val-opacity">100%</span>
       </div>
 
-      <div class="toggle-row" style="margin-top: 10px;">
-        <label title="A projeção atravessa a arma toda, pintando o outro lado espelhado">Atravessar Arma (Raio-X)</label>
-        <button class="toggle-chip active" id="btn-xray" onclick="toggleXray()">ON</button>
+      <div class="row-pair">
+        <button class="btn-ghost" id="btn-fit-cover" title="Preenche todo o UV (corta sobra)">⛶ Cover</button>
+        <button class="btn-ghost" id="btn-fit-contain" title="Caber dentro do UV (deixa borda)">▣ Contain</button>
       </div>
-
-      <div class="divider"></div>
-      <button class="btn-reset" onclick="resetTransform()">↺ Resetar Ajustes</button>
+      <button class="btn-reset" id="btn-reset-tx">↺ Resetar Ajustes</button>
     </div>
 
     <div class="panel" id="panel-export" style="display:none">
-      <div class="panel-header">04 · Gerar Textura</div>
-      <div class="slider-row" style="margin-bottom:12px">
-        <label>Resolução</label>
-        <select id="sl-res">
-          <option value="64">64 px</option>
-          <option value="128">128 px</option>
-          <option value="256" selected>256 px</option>
-          <option value="512">512 px</option>
-        </select>
-      </div>
-      <button class="btn-export" onclick="bakeAndExport()">💾 Baixar Textura PNG</button>
-      <div style="font-size:0.6rem; color:var(--text-2); text-align:center; margin-top:8px;">
-        A imagem será recortada e mapeada para todos os UVs originais da arma.
-      </div>
+      <div class="panel-header">04 · Exportar Textura</div>
+      <button class="btn-export" id="btn-export">💾 Baixar PNG</button>
+      <div class="hint">A textura é gerada no tamanho nativo do .json (texture_width × texture_height).</div>
     </div>
   </aside>
 
-  <!-- VIEWPORT 3D -->
-  <main class="viewport">
-    
-    <!-- Top toolbar -->
-    <div class="vp-toolbar" id="vp-toolbar" style="display:none">
-      <div class="vp-tools">
-        <button class="vp-btn active" id="mode-orbit" onclick="setMode('orbit')" title="Girar e dar zoom na arma">🔄 Girar Câmera</button>
-        <button class="vp-btn" id="mode-move" onclick="setMode('move')" title="Arrastar a imagem sobre a arma">✋ Mover Imagem (Projeção)</button>
-      </div>
-      <div class="vp-tools">
+  <!-- MAIN: 3D PREVIEW + UV ATLAS EDITOR -->
+  <main class="main">
+    <section class="viewport viewport-3d" id="viewport-3d-wrap">
+      <div class="vp-toolbar">
         <button class="vp-btn-icon" onclick="resetCam()" title="Resetar câmera">⊹</button>
       </div>
-    </div>
+      <div id="viewport-3d"></div>
+      <div class="vp-empty" id="vp-empty">
+        <div class="vp-empty-icon">⚔️</div>
+        <div>Carregue um JSON de geometria para começar</div>
+      </div>
+    </section>
 
-    <div id="three-container"></div>
-    
-    <div class="vp-empty" id="vp-empty">
-      <div class="vp-empty-icon">⚔️</div>
-      <div>Carregue um JSON de geometria para começar</div>
-    </div>
+    <section class="atlas">
+      <div class="atlas-header">
+        <span class="atlas-title">Atlas UV</span>
+        <span class="atlas-meta" id="atlas-meta">— × —</span>
+        <span class="atlas-hint">Arraste a imagem · scroll para escalar</span>
+      </div>
+      <div class="atlas-wrap" id="atlas-wrap">
+        <canvas id="atlas-canvas"></canvas>
+      </div>
+    </section>
   </main>
 </div>
 
 <div class="toast" id="toast"></div>
-
-<!-- Offscreen canvas for baking -->
-<canvas id="bake-canvas" style="display:none;"></canvas>
 
 <script type="importmap">
 {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/"}}
