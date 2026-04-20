@@ -1,7 +1,13 @@
 /**
- * CS:Craft Skin Maker — UV-Space Sticker
- * Drop an image, it adapts to the UV layout of the .json geometry.
- * The 3D viewport is a live preview; all editing happens on the UV atlas.
+ * CS:Craft Skin Maker — Projection Painter
+ *
+ * Fluxo:
+ *  1. Carrega geometria JSON (bones + cubes com UV).
+ *  2. A imagem aparece como um DECAL flutuante em cima do viewport 3D.
+ *  3. Você orbita a arma pra mirar, move/escala/gira o decal na tela.
+ *  4. "Gravar" faz raycasting: cada pixel do decal vira um raio pela câmera.
+ *     O primeiro hit (ou todos, se X-Ray) é pintado na UV atlas.
+ *  5. Baixa a PNG já no formato (texture_width × texture_height) do JSON.
  */
 
 import * as THREE from 'three';
@@ -27,24 +33,32 @@ const S = {
   controls: null,
   meshGroup: null,
 
-  // Texture pipeline
+  // Persistent baked texture (applied to the 3D model)
   bakeCanvas: null,
   bakeCtx: null,
   bakeTex: null,
 
-  // UV atlas
+  // Atlas preview (read-only)
   atlasCanvas: null,
   atlasCtx: null,
   uvRects: [],
   uvBBox: null,
 
-  // Sticker
+  // User image + cached pixel buffer
   userImg: null,
-  // {cx, cy} center in tex px; baseW/baseH = autofit size; scale relative to base
-  sticker: null,
+  userImgW: 0,
+  userImgH: 0,
+  userImgPixels: null,
+
+  // Screen-space decal state (viewport pixel coords)
+  decal: null,   // { cx, cy, baseW, baseH, scale, rot, opacity }
+
+  // X-Ray mode (paint through model onto back faces too)
+  xray: false,
 
   // Drag state
-  drag: null,
+  dragMode: null,          // 'move' | 'scale' | 'rotate'
+  dragStart: null,
 };
 
 // ════════════════════════════════
@@ -53,15 +67,16 @@ const S = {
 function init() {
   initBakeTexture();
   initThree();
-  initAtlas();
+  initAtlasPreview();
   wireUi();
+  positionDecalOverlay();
 }
 
 function initBakeTexture() {
   S.bakeCanvas = document.createElement('canvas');
   S.bakeCanvas.width = S.texW;
   S.bakeCanvas.height = S.texH;
-  S.bakeCtx = S.bakeCanvas.getContext('2d');
+  S.bakeCtx = S.bakeCanvas.getContext('2d', { willReadFrequently: true });
   S.bakeTex = new THREE.CanvasTexture(S.bakeCanvas);
   S.bakeTex.colorSpace = THREE.SRGBColorSpace;
   S.bakeTex.magFilter = THREE.NearestFilter;
@@ -125,7 +140,7 @@ function initThree() {
 function parseGeo(data) {
   const geos = data['minecraft:geometry'];
   if (!geos || !geos[0]) {
-    toast('⚠️ JSON sem minecraft:geometry');
+    toast('JSON sem minecraft:geometry');
     return;
   }
   const geo = geos[0];
@@ -138,41 +153,28 @@ function parseGeo(data) {
   resizeBakeTexture(S.texW, S.texH);
   computeUvRects();
   buildModel();
-  bake();
-  drawAtlas();
+  S.bakeTex.needsUpdate = true;
+  drawAtlasPreview();
 
   $('vp-empty').style.display = 'none';
   $('header-info').textContent = desc.identifier || '(geometry)';
   $('atlas-meta').textContent = `${S.texW} × ${S.texH} · ${S.uvRects.length} faces UV`;
-  toast(`✅ ${S.allMeshes.length} cubos carregados`);
+  toast(`${S.allMeshes.length} cubos carregados`);
 }
 
-// Expand Bedrock "box UV" (single [u,v] offset) into per-face UV rects.
-// Standard Bedrock layout (no mirror):
+// Expand Bedrock/Java "box UV" (single [u,v] offset) into per-face UV rects.
+// Layout (no mirror):
 //   [  UP (W×D)  ][  DOWN (W×D)  ]
 //   [ W (D×H) ][ N (W×H) ][ E (D×H) ][ S (W×H) ]
-// With mirror=true, east/west swap.
 function expandBoxUv(cube) {
   const uv = cube.uv;
   if (!uv) return {};
-  if (!Array.isArray(uv)) return uv; // already per-face
+  if (!Array.isArray(uv)) return uv;
 
   const [u, v] = uv;
   const [W, H, D] = cube.size || [1, 1, 1];
-  // NOTE: UV uses the UN-inflated cube size (that's how Blockbench/Bedrock behave).
-  //
-  // For UP/DOWN faces in box UV, Bedrock's "unfolded net" convention places
-  // the -Z (north) edge at the BOTTOM of the UP rect and at the TOP of the DOWN rect.
-  // Per-face UV would put -Z at the top. To re-use the same BoxGeometry vertex→UV
-  // mapping, we emit NEGATIVE V sizes on UP (and positive on DOWN, flipped on U
-  // via the offset) so the rendered face ends up oriented correctly.
-  //
-  // Layout (no mirror):
-  //   [  UP (W×D)  ][  DOWN (W×D)  ]
-  //   [ W(D×H) ][ N(W×H) ][ E(D×H) ][ S(W×H) ]
   const out = {};
   if (cube.mirror === true) {
-    // Mirrored: east/west swap + UP/DOWN flipped horizontally
     out.up    = { uv: [u + D + W,     v + D],   uv_size: [-W, -D] };
     out.down  = { uv: [u + D + 2 * W, v],       uv_size: [-W,  D] };
     out.east  = { uv: [u,             v + D],   uv_size: [D, H] };
@@ -180,8 +182,8 @@ function expandBoxUv(cube) {
     out.west  = { uv: [u + D + W,     v + D],   uv_size: [D, H] };
     out.south = { uv: [u + 2 * D + W, v + D],   uv_size: [W, H] };
   } else {
-    out.up    = { uv: [u + D,         v + D],   uv_size: [ W, -D] }; // -Z at bottom of rect
-    out.down  = { uv: [u + D + 2 * W, v],       uv_size: [-W,  D] }; // rotated 180° vs UP
+    out.up    = { uv: [u + D,         v + D],   uv_size: [ W, -D] };
+    out.down  = { uv: [u + D + 2 * W, v],       uv_size: [-W,  D] };
     out.west  = { uv: [u,             v + D],   uv_size: [D, H] };
     out.north = { uv: [u + D,         v + D],   uv_size: [W, H] };
     out.east  = { uv: [u + D + W,     v + D],   uv_size: [D, H] };
@@ -236,15 +238,12 @@ function buildModel() {
   S.allMeshes = [];
   S.meshGroup = new THREE.Group();
 
-  // Build pivots map — Bedrock and Three.js are both right-handed with +Y up,
-  // so we use coordinates directly (NO X flip).
   const pivotOf = {};
   (S.geo.bones || []).forEach(bone => {
     const p = bone.pivot || [0, 0, 0];
     pivotOf[bone.name] = [p[0] * SCALE, p[1] * SCALE, p[2] * SCALE];
   });
 
-  // Bone groups
   const boneGroup = {};
   (S.geo.bones || []).forEach(bone => {
     const g = new THREE.Group();
@@ -257,7 +256,6 @@ function buildModel() {
       g.position.set(myPiv[0], myPiv[1], myPiv[2]);
     }
     if (bone.rotation) {
-      // Bedrock/Blockbench apply rotations as intrinsic ZYX (Z first, then Y, then X).
       g.rotation.set(
         THREE.MathUtils.degToRad(bone.rotation[0]),
         THREE.MathUtils.degToRad(bone.rotation[1]),
@@ -268,7 +266,6 @@ function buildModel() {
     boneGroup[bone.name] = g;
   });
 
-  // Hierarchy
   (S.geo.bones || []).forEach(bone => {
     if (bone.parent && boneGroup[bone.parent]) {
       boneGroup[bone.parent].add(boneGroup[bone.name]);
@@ -277,7 +274,6 @@ function buildModel() {
     }
   });
 
-  // Cubes
   const sharedMat = new THREE.MeshLambertMaterial({
     map: S.bakeTex,
     color: 0xffffff,
@@ -303,8 +299,6 @@ function buildModel() {
       const geom = buildCubeGeometry(rw, rh, rd, uvMap, S.texW, S.texH);
       const mesh = new THREE.Mesh(geom, sharedMat);
 
-      // Cube center in Bedrock coords (no X flip). Inflate expands symmetrically
-      // so the center stays at (origin + size/2).
       const cx = (ox + sx / 2) * SCALE;
       const cy = (oy + sy / 2) * SCALE;
       const cz = (oz + sz / 2) * SCALE;
@@ -337,7 +331,6 @@ function buildModel() {
 
   S.scene.add(S.meshGroup);
 
-  // Center on origin
   const box = new THREE.Box3().setFromObject(S.meshGroup);
   if (!box.isEmpty()) {
     const c = box.getCenter(new THREE.Vector3());
@@ -359,7 +352,6 @@ function buildCubeGeometry(w, h, d, uvMap, texW, texH) {
     const fd = uvMap[face];
 
     if (!fd || !fd.uv) {
-      // Unmapped face → degenerate UV (samples (0,0) which is transparent)
       for (let j = 0; j < 4; j++) uvs.setXY(base + j, 0, 0);
       continue;
     }
@@ -391,42 +383,27 @@ window.resetCam = function resetCam() {
 };
 
 // ════════════════════════════════
-// ATLAS EDITOR
+// ATLAS PREVIEW  (read-only)
 // ════════════════════════════════
-function initAtlas() {
+function initAtlasPreview() {
   S.atlasCanvas = $('atlas-canvas');
   S.atlasCtx = S.atlasCanvas.getContext('2d');
-
-  S.atlasCanvas.addEventListener('mousedown', onAtlasDown);
-  window.addEventListener('mousemove', onAtlasMove);
-  window.addEventListener('mouseup', onAtlasUp);
-  S.atlasCanvas.addEventListener('wheel', onAtlasWheel, { passive: false });
-
-  new ResizeObserver(() => drawAtlas()).observe(S.atlasCanvas.parentElement);
-
-  drawAtlas();
+  new ResizeObserver(() => drawAtlasPreview()).observe(S.atlasCanvas.parentElement);
+  drawAtlasPreview();
 }
 
-function atlasMetrics() {
-  const wrap = S.atlasCanvas.parentElement;
-  const W = wrap.clientWidth;
-  const H = wrap.clientHeight;
-  const aspect = S.texW / S.texH;
-  let dispW, dispH;
-  if (W / H > aspect) {
-    dispH = H;
-    dispW = H * aspect;
-  } else {
-    dispW = W;
-    dispH = W / aspect;
-  }
-  return { dispW, dispH, sx: dispW / S.texW, sy: dispH / S.texH };
-}
-
-function drawAtlas() {
+function drawAtlasPreview() {
   const cv = S.atlasCanvas;
   const ctx = S.atlasCtx;
-  const { dispW, dispH, sx, sy } = atlasMetrics();
+  const wrap = cv.parentElement;
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  const aspect = S.texW / S.texH;
+  let dispW, dispH;
+  if (W / H > aspect) { dispH = H; dispW = H * aspect; }
+  else { dispW = W; dispH = W / aspect; }
+
+  const sx = dispW / S.texW;
+  const sy = dispH / S.texH;
 
   const dpr = Math.min(devicePixelRatio, 2);
   cv.width = Math.max(1, Math.floor(dispW * dpr));
@@ -435,7 +412,7 @@ function drawAtlas() {
   cv.style.height = dispH + 'px';
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  // Checker bg
+  // Checker background (transparency indicator)
   ctx.fillStyle = '#141a24';
   ctx.fillRect(0, 0, dispW, dispH);
   ctx.fillStyle = '#1c2333';
@@ -446,7 +423,7 @@ function drawAtlas() {
     }
   }
 
-  // Baked texture (the real export)
+  // Baked texture
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(S.bakeCanvas, 0, 0, dispW, dispH);
 
@@ -461,163 +438,286 @@ function drawAtlas() {
       Math.max(1, Math.round(r.h * sy) - 1),
     );
   });
-
-  // UV bbox highlight
-  if (S.uvBBox && S.uvBBox.w > 0) {
-    ctx.strokeStyle = 'rgba(104, 211, 145, 0.45)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([3, 3]);
-    ctx.strokeRect(
-      S.uvBBox.x * sx + 0.5,
-      S.uvBBox.y * sy + 0.5,
-      S.uvBBox.w * sx - 1,
-      S.uvBBox.h * sy - 1,
-    );
-    ctx.setLineDash([]);
-  }
-
-  // Sticker overlay (selection box + handle)
-  if (S.sticker && S.userImg) {
-    const s = S.sticker;
-    const w = s.baseW * s.scale;
-    const h = s.baseH * s.scale;
-    ctx.save();
-    ctx.translate(s.cx * sx, s.cy * sy);
-    ctx.rotate((s.rot * Math.PI) / 180);
-    ctx.strokeStyle = 'rgba(246, 173, 85, 0.95)';
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([5, 4]);
-    ctx.strokeRect((-w / 2) * sx, (-h / 2) * sy, w * sx, h * sy);
-    ctx.setLineDash([]);
-    ctx.fillStyle = '#f6ad55';
-    ctx.beginPath();
-    ctx.arc(0, 0, 3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-  }
-}
-
-function clientToTex(clientX, clientY) {
-  const r = S.atlasCanvas.getBoundingClientRect();
-  return [
-    ((clientX - r.left) / r.width) * S.texW,
-    ((clientY - r.top) / r.height) * S.texH,
-  ];
-}
-
-function onAtlasDown(e) {
-  if (!S.userImg || !S.sticker) return;
-  e.preventDefault();
-  const [tx, ty] = clientToTex(e.clientX, e.clientY);
-  S.drag = {
-    mode: 'move',
-    startTx: tx,
-    startTy: ty,
-    startCx: S.sticker.cx,
-    startCy: S.sticker.cy,
-  };
-  S.atlasCanvas.style.cursor = 'grabbing';
-}
-
-function onAtlasMove(e) {
-  if (!S.drag) return;
-  const [tx, ty] = clientToTex(e.clientX, e.clientY);
-  if (S.drag.mode === 'move') {
-    S.sticker.cx = S.drag.startCx + (tx - S.drag.startTx);
-    S.sticker.cy = S.drag.startCy + (ty - S.drag.startTy);
-    bake();
-  }
-}
-
-function onAtlasUp() {
-  S.drag = null;
-  S.atlasCanvas.style.cursor = '';
-}
-
-function onAtlasWheel(e) {
-  if (!S.sticker) return;
-  e.preventDefault();
-  const factor = e.deltaY < 0 ? 1.06 : 1 / 1.06;
-  S.sticker.scale = Math.max(0.05, Math.min(20, S.sticker.scale * factor));
-  syncScaleSlider();
-  bake();
-}
-
-function syncScaleSlider() {
-  if (!S.sticker) return;
-  $('sl-scale').value = S.sticker.scale;
-  $('val-scale').textContent = S.sticker.scale.toFixed(2);
 }
 
 // ════════════════════════════════
-// BAKE TEXTURE
+// DECAL OVERLAY  (screen-space sticker)
 // ════════════════════════════════
-function bake() {
-  const ctx = S.bakeCtx;
-  ctx.clearRect(0, 0, S.bakeCanvas.width, S.bakeCanvas.height);
-  if (S.userImg && S.sticker) {
-    const s = S.sticker;
-    const w = s.baseW * s.scale;
-    const h = s.baseH * s.scale;
-    ctx.save();
-    ctx.globalAlpha = s.opacity;
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.translate(s.cx, s.cy);
-    ctx.rotate((s.rot * Math.PI) / 180);
-    ctx.drawImage(S.userImg, -w / 2, -h / 2, w, h);
-    ctx.restore();
+function positionDecalOverlay() {
+  const el = $('decal-box');
+  if (!el) return;
+  if (!S.decal) {
+    el.style.display = 'none';
+    return;
   }
-  S.bakeTex.needsUpdate = true;
-  drawAtlas();
+  const d = S.decal;
+  el.style.display = 'block';
+  el.style.left = d.cx + 'px';
+  el.style.top = d.cy + 'px';
+  el.style.width = d.baseW + 'px';
+  el.style.height = d.baseH + 'px';
+  el.style.transform =
+    `translate(-50%, -50%) rotate(${d.rot}deg) scale(${d.scale})`;
+  el.style.opacity = d.opacity;
+  $('decal-img').src = S.userImg ? S.userImg.src : '';
 }
 
-// Build sticker baseline from the UV bbox using cover-fit (image keeps aspect).
-function autoFitSticker(mode) {
-  if (!S.userImg) return;
-  const bb = S.uvBBox && S.uvBBox.w > 0 ? S.uvBBox : { x: 0, y: 0, w: S.texW, h: S.texH };
-  const imgA = S.userImg.naturalWidth / S.userImg.naturalHeight;
-  const bbA = bb.w / bb.h;
+function autoPlaceDecal() {
+  const vp = S.renderer.domElement;
+  const w = vp.clientWidth, h = vp.clientHeight;
+  const target = Math.min(w, h) * 0.35;
+  const aspect = S.userImg.naturalWidth / S.userImg.naturalHeight;
   let baseW, baseH;
-  if (mode === 'contain') {
-    if (imgA > bbA) {
-      baseW = bb.w;
-      baseH = bb.w / imgA;
-    } else {
-      baseH = bb.h;
-      baseW = bb.h * imgA;
-    }
-  } else {
-    // cover (default)
-    if (imgA > bbA) {
-      baseH = bb.h;
-      baseW = bb.h * imgA;
-    } else {
-      baseW = bb.w;
-      baseH = bb.w / imgA;
-    }
-  }
-  S.sticker = {
-    cx: bb.x + bb.w / 2,
-    cy: bb.y + bb.h / 2,
-    baseW,
-    baseH,
-    scale: 1,
-    rot: 0,
-    opacity: 1,
+  if (aspect >= 1) { baseW = target; baseH = target / aspect; }
+  else { baseH = target; baseW = target * aspect; }
+  S.decal = {
+    cx: w / 2, cy: h / 2,
+    baseW, baseH,
+    scale: 1, rot: 0, opacity: 1,
   };
   $('sl-scale').value = 1;
   $('val-scale').textContent = '1.00';
   $('sl-rot').value = 0;
-  $('val-rot').textContent = '0��';
+  $('val-rot').textContent = '0°';
   $('sl-opacity').value = 1;
   $('val-opacity').textContent = '100%';
+  positionDecalOverlay();
+}
+
+// --- Decal drag handling ---------------------------------------------------
+function startDrag(e, mode) {
+  if (!S.decal) return;
+  e.preventDefault();
+  e.stopPropagation();
+  S.dragMode = mode;
+  S.dragStart = {
+    x: e.clientX,
+    y: e.clientY,
+    decal: { ...S.decal },
+  };
+  S.controls.enabled = false;
+  window.addEventListener('pointermove', onDragMove);
+  window.addEventListener('pointerup', onDragUp);
+  window.addEventListener('pointercancel', onDragUp);
+}
+
+function onDragMove(e) {
+  if (!S.dragMode || !S.decal || !S.dragStart) return;
+  const dx = e.clientX - S.dragStart.x;
+  const dy = e.clientY - S.dragStart.y;
+  const start = S.dragStart.decal;
+
+  if (S.dragMode === 'move') {
+    S.decal.cx = start.cx + dx;
+    S.decal.cy = start.cy + dy;
+  } else if (S.dragMode === 'scale') {
+    const vp = S.renderer.domElement.getBoundingClientRect();
+    const cxAbs = vp.left + start.cx;
+    const cyAbs = vp.top + start.cy;
+    const d0 = Math.hypot(S.dragStart.x - cxAbs, S.dragStart.y - cyAbs);
+    const d1 = Math.hypot(e.clientX - cxAbs, e.clientY - cyAbs);
+    if (d0 > 1) {
+      const ns = Math.max(0.05, Math.min(20, start.scale * (d1 / d0)));
+      S.decal.scale = ns;
+      $('sl-scale').value = ns;
+      $('val-scale').textContent = ns.toFixed(2);
+    }
+  } else if (S.dragMode === 'rotate') {
+    const vp = S.renderer.domElement.getBoundingClientRect();
+    const cxAbs = vp.left + start.cx;
+    const cyAbs = vp.top + start.cy;
+    const a0 = Math.atan2(S.dragStart.y - cyAbs, S.dragStart.x - cxAbs);
+    const a1 = Math.atan2(e.clientY - cyAbs, e.clientX - cxAbs);
+    const deg = start.rot + ((a1 - a0) * 180 / Math.PI);
+    const clamped = ((deg + 180) % 360 + 360) % 360 - 180;
+    S.decal.rot = clamped;
+    $('sl-rot').value = clamped;
+    $('val-rot').textContent = Math.round(clamped) + '°';
+  }
+
+  positionDecalOverlay();
+}
+
+function onDragUp() {
+  S.dragMode = null;
+  S.dragStart = null;
+  S.controls.enabled = true;
+  window.removeEventListener('pointermove', onDragMove);
+  window.removeEventListener('pointerup', onDragUp);
+  window.removeEventListener('pointercancel', onDragUp);
+}
+
+// ════════════════════════════════
+// PROJECTION BAKE (the magic)
+// ════════════════════════════════
+function cacheUserImgPixels() {
+  if (!S.userImg) return;
+  if (S.userImgPixels && S.userImgW === S.userImg.naturalWidth) return;
+  const cv = document.createElement('canvas');
+  cv.width = S.userImgW = S.userImg.naturalWidth;
+  cv.height = S.userImgH = S.userImg.naturalHeight;
+  const c = cv.getContext('2d');
+  c.drawImage(S.userImg, 0, 0);
+  S.userImgPixels = c.getImageData(0, 0, cv.width, cv.height).data;
+}
+
+// Convert a viewport pixel (px, py) to decal-local [0..1] coords.
+function screenToDecalUV(px, py) {
+  const d = S.decal;
+  const w = d.baseW * d.scale;
+  const h = d.baseH * d.scale;
+  const rad = -d.rot * Math.PI / 180;
+  const dx = px - d.cx;
+  const dy = py - d.cy;
+  const c = Math.cos(rad), s = Math.sin(rad);
+  const rx = c * dx - s * dy;
+  const ry = s * dx + c * dy;
+  return {
+    u: rx / w + 0.5,
+    v: ry / h + 0.5,
+  };
+}
+
+function decalScreenAABB() {
+  const d = S.decal;
+  const w = d.baseW * d.scale / 2;
+  const h = d.baseH * d.scale / 2;
+  const rad = d.rot * Math.PI / 180;
+  const c = Math.cos(rad), s = Math.sin(rad);
+  const corners = [
+    [-w, -h], [w, -h], [w, h], [-w, h],
+  ].map(([x, y]) => [d.cx + c * x - s * y, d.cy + s * x + c * y]);
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const [x, y] of corners) {
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+// Paint the decal onto the UV atlas by raycasting through the current camera.
+async function projectBake() {
+  if (!S.userImg || !S.decal || !S.allMeshes.length) {
+    toast('Carregue JSON e imagem primeiro');
+    return;
+  }
+  cacheUserImgPixels();
+
+  const canvas = S.renderer.domElement;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  const bbox = decalScreenAABB();
+  const minX = Math.max(0, Math.floor(bbox.minX));
+  const minY = Math.max(0, Math.floor(bbox.minY));
+  const maxX = Math.min(W, Math.ceil(bbox.maxX));
+  const maxY = Math.min(H, Math.ceil(bbox.maxY));
+  if (maxX <= minX || maxY <= minY) {
+    toast('O decal está fora da janela 3D');
+    return;
+  }
+
+  // Aim for a reasonable number of rays: subsample large decals so a huge
+  // sticker doesn't freeze the browser. We then smear each sample onto a
+  // small area in the texture atlas.
+  const decalPxW = maxX - minX;
+  const decalPxH = maxY - minY;
+  const MAX_RAYS = 280 * 280;
+  let stride = 1;
+  while ((decalPxW * decalPxH) / (stride * stride) > MAX_RAYS) stride++;
+
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  const texPixels = new Uint8ClampedArray(S.texW * S.texH * 4);
+  const imgPx = S.userImgPixels;
+  const imgW = S.userImgW, imgH = S.userImgH;
+  const opacity = S.decal.opacity;
+
+  // Flash decal opacity indicator
+  $('btn-bake').classList.add('working');
+
+  let painted = 0;
+
+  for (let py = minY; py < maxY; py += stride) {
+    for (let px = minX; px < maxX; px += stride) {
+      const { u, v } = screenToDecalUV(px + 0.5, py + 0.5);
+      if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
+
+      const ix = Math.min(imgW - 1, Math.max(0, Math.floor(u * imgW)));
+      const iy = Math.min(imgH - 1, Math.max(0, Math.floor(v * imgH)));
+      const sIdx = (iy * imgW + ix) * 4;
+      const a = imgPx[sIdx + 3];
+      if (a === 0) continue;
+
+      ndc.x = (px / W) * 2 - 1;
+      ndc.y = -(py / H) * 2 + 1;
+      raycaster.setFromCamera(ndc, S.camera);
+      const hits = raycaster.intersectObjects(S.allMeshes, false);
+      if (!hits.length) continue;
+
+      const targets = S.xray ? hits : [hits[0]];
+      for (const hit of targets) {
+        if (!hit.uv) continue;
+        const tx = Math.floor(hit.uv.x * S.texW);
+        const ty = Math.floor((1 - hit.uv.y) * S.texH);
+        if (tx < 0 || tx >= S.texW || ty < 0 || ty >= S.texH) continue;
+
+        // Smear over a (stride × stride) region so sampling gaps still cover
+        // their pixels on the atlas. Also write to a ±1 neighborhood to
+        // avoid single-pixel holes along seams.
+        for (let oy = -1; oy <= 1; oy++) {
+          for (let ox = -1; ox <= 1; ox++) {
+            const nx = tx + ox;
+            const ny = ty + oy;
+            if (nx < 0 || nx >= S.texW || ny < 0 || ny >= S.texH) continue;
+            const tIdx = (ny * S.texW + nx) * 4;
+            const aOut = Math.max(texPixels[tIdx + 3], a);
+            texPixels[tIdx + 0] = imgPx[sIdx + 0];
+            texPixels[tIdx + 1] = imgPx[sIdx + 1];
+            texPixels[tIdx + 2] = imgPx[sIdx + 2];
+            texPixels[tIdx + 3] = aOut;
+          }
+        }
+        painted++;
+      }
+    }
+  }
+
+  // Composite onto the persistent bake canvas with the decal's opacity
+  if (painted > 0) {
+    const layer = document.createElement('canvas');
+    layer.width = S.texW;
+    layer.height = S.texH;
+    const lctx = layer.getContext('2d');
+    const id = new ImageData(texPixels, S.texW, S.texH);
+    lctx.putImageData(id, 0, 0);
+
+    S.bakeCtx.globalAlpha = opacity;
+    S.bakeCtx.imageSmoothingEnabled = false;
+    S.bakeCtx.drawImage(layer, 0, 0);
+    S.bakeCtx.globalAlpha = 1;
+    S.bakeTex.needsUpdate = true;
+    drawAtlasPreview();
+    toast(`Gravado: ${painted} pixels pintados`);
+  } else {
+    toast('Nenhum pixel atingiu a arma — aproxime o decal');
+  }
+
+  $('btn-bake').classList.remove('working');
+}
+
+function clearBake() {
+  S.bakeCtx.clearRect(0, 0, S.bakeCanvas.width, S.bakeCanvas.height);
+  S.bakeTex.needsUpdate = true;
+  drawAtlasPreview();
+  toast('Textura limpa');
 }
 
 // ════════════════════════════════
 // UI WIRING
 // ════════════════════════════════
 function wireUi() {
+  // JSON
   $('btn-json').addEventListener('click', () => $('inp-json').click());
   $('inp-json').addEventListener('change', e => {
     const f = e.target.files[0];
@@ -630,12 +730,13 @@ function wireUi() {
         $('btn-json').classList.add('loaded');
         $('panel-image').style.display = 'flex';
       } catch (err) {
-        toast('⚠️ JSON inválido: ' + err.message);
+        toast('JSON inválido: ' + err.message);
       }
     };
     r.readAsText(f);
   });
 
+  // Image
   $('btn-img').addEventListener('click', () => $('inp-img').click());
   $('inp-img').addEventListener('change', e => {
     const f = e.target.files[0];
@@ -643,10 +744,11 @@ function wireUi() {
     loadImage(f);
   });
 
-  // Drag-and-drop image into atlas wrapper
-  const dropZone = $('atlas-wrap');
+  // Drag-and-drop image into the 3D viewport
+  const dropZone = $('viewport-3d-wrap');
   ['dragenter', 'dragover'].forEach(ev =>
     dropZone.addEventListener(ev, e => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
       e.preventDefault();
       dropZone.classList.add('drag-hover');
     })
@@ -662,48 +764,76 @@ function wireUi() {
     if (f && f.type.startsWith('image/')) loadImage(f);
   });
 
+  // Decal interactions
+  const decalBox = $('decal-box');
+  decalBox.addEventListener('pointerdown', e => {
+    if (e.target.dataset.handle) return; // handles manage themselves
+    startDrag(e, 'move');
+  });
+  $('handle-scale').addEventListener('pointerdown', e => startDrag(e, 'scale'));
+  $('handle-rot').addEventListener('pointerdown', e => startDrag(e, 'rotate'));
+
+  // Wheel on decal = scale
+  decalBox.addEventListener('wheel', e => {
+    if (!S.decal) return;
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.06 : 1 / 1.06;
+    S.decal.scale = Math.max(0.05, Math.min(20, S.decal.scale * factor));
+    $('sl-scale').value = S.decal.scale;
+    $('val-scale').textContent = S.decal.scale.toFixed(2);
+    positionDecalOverlay();
+  }, { passive: false });
+
   // Sliders
   $('sl-scale').addEventListener('input', e => {
-    if (!S.sticker) return;
-    S.sticker.scale = parseFloat(e.target.value);
-    $('val-scale').textContent = S.sticker.scale.toFixed(2);
-    bake();
+    if (!S.decal) return;
+    S.decal.scale = parseFloat(e.target.value);
+    $('val-scale').textContent = S.decal.scale.toFixed(2);
+    positionDecalOverlay();
   });
   $('sl-rot').addEventListener('input', e => {
-    if (!S.sticker) return;
-    S.sticker.rot = parseFloat(e.target.value);
-    $('val-rot').textContent = Math.round(S.sticker.rot) + '°';
-    bake();
+    if (!S.decal) return;
+    S.decal.rot = parseFloat(e.target.value);
+    $('val-rot').textContent = Math.round(S.decal.rot) + '°';
+    positionDecalOverlay();
   });
   $('sl-opacity').addEventListener('input', e => {
-    if (!S.sticker) return;
-    S.sticker.opacity = parseFloat(e.target.value);
-    $('val-opacity').textContent = Math.round(S.sticker.opacity * 100) + '%';
-    bake();
+    if (!S.decal) return;
+    S.decal.opacity = parseFloat(e.target.value);
+    $('val-opacity').textContent = Math.round(S.decal.opacity * 100) + '%';
+    positionDecalOverlay();
   });
 
-  $('btn-fit-cover').addEventListener('click', () => {
-    if (!S.userImg) return;
-    autoFitSticker('cover');
-    bake();
-  });
-  $('btn-fit-contain').addEventListener('click', () => {
-    if (!S.userImg) return;
-    autoFitSticker('contain');
-    bake();
-  });
   $('btn-reset-tx').addEventListener('click', () => {
-    if (!S.sticker) return;
-    S.sticker.rot = 0;
-    S.sticker.scale = 1;
-    S.sticker.opacity = 1;
+    if (!S.decal) return;
+    S.decal.rot = 0;
+    S.decal.scale = 1;
+    S.decal.opacity = 1;
     $('sl-rot').value = 0; $('val-rot').textContent = '0°';
     $('sl-scale').value = 1; $('val-scale').textContent = '1.00';
     $('sl-opacity').value = 1; $('val-opacity').textContent = '100%';
-    bake();
+    positionDecalOverlay();
+  });
+  $('btn-recenter').addEventListener('click', () => {
+    if (!S.userImg) return;
+    autoPlaceDecal();
   });
 
+  // X-Ray toggle
+  $('chk-xray').addEventListener('change', e => {
+    S.xray = e.target.checked;
+    $('btn-bake').classList.toggle('xray', S.xray);
+  });
+
+  // Bake + clear + export
+  $('btn-bake').addEventListener('click', () => projectBake());
+  $('btn-clear').addEventListener('click', () => clearBake());
   $('btn-export').addEventListener('click', exportPng);
+
+  // Reposition decal when window resizes
+  window.addEventListener('resize', () => {
+    if (S.decal) positionDecalOverlay();
+  });
 }
 
 function loadImage(file) {
@@ -712,16 +842,17 @@ function loadImage(file) {
     const img = new Image();
     img.onload = () => {
       S.userImg = img;
+      S.userImgPixels = null; // invalidate cache
       $('img-thumb').src = ev.target.result;
       $('img-preview').style.display = 'block';
       $('img-text').textContent = file.name;
       $('btn-img').classList.add('loaded');
       $('panel-transform').style.display = 'flex';
+      $('panel-bake').style.display = 'flex';
       $('panel-export').style.display = 'flex';
 
-      autoFitSticker('cover');
-      bake();
-      toast('🎨 Imagem ajustada ao UV. Arraste para reposicionar.');
+      autoPlaceDecal();
+      toast('Mire a arma e clique em "Gravar na arma"');
     };
     img.src = ev.target.result;
   };
@@ -729,8 +860,8 @@ function loadImage(file) {
 }
 
 function exportPng() {
-  if (!S.userImg) {
-    toast('⚠️ Carregue uma imagem primeiro');
+  if (!S.geo) {
+    toast('Carregue um JSON primeiro');
     return;
   }
   S.bakeCanvas.toBlob(blob => {
@@ -740,7 +871,7 @@ function exportPng() {
     });
     a.click();
     URL.revokeObjectURL(a.href);
-    toast(`✅ Textura ${S.texW}×${S.texH} exportada`);
+    toast(`Textura ${S.texW}×${S.texH} exportada`);
   }, 'image/png');
 }
 
@@ -752,7 +883,7 @@ function toast(msg) {
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => t.classList.remove('show'), 3500);
+  toast._t = setTimeout(() => t.classList.remove('show'), 3200);
 }
 
 init();

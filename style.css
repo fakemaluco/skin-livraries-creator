@@ -10,6 +10,7 @@
   --accent:    #63b3ed;
   --accent2:   #f6ad55;
   --accent3:   #68d391;
+  --danger:    #fc8181;
   --text:      #dde4f0;
   --text-2:    #647080;
   --text-3:    #3a4455;
@@ -69,7 +70,7 @@ body {
 
 /* SIDEBAR */
 .sidebar {
-  width: 280px; flex-shrink: 0;
+  width: 290px; flex-shrink: 0;
   background: var(--bg-panel);
   border-right: 1px solid var(--border);
   overflow-y: auto; overflow-x: hidden;
@@ -96,7 +97,7 @@ body {
 }
 .upload-btn:hover { border-color: var(--accent); background: rgba(99,179,237,0.04); }
 .upload-btn.loaded { border-color: rgba(104,211,145,0.3); border-style: solid; }
-.upload-icon { font-size: 1.2rem; }
+.upload-icon { font-size: 1.1rem; color: var(--accent); }
 .upload-text { font-size: 0.75rem; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .img-preview {
@@ -140,6 +141,60 @@ body {
 }
 .btn-reset:hover { background: rgba(255,255,255,0.08); color: var(--text); }
 
+/* ==== X-Ray toggle =================================================== */
+.toggle-row {
+  display: flex; align-items: center; gap: 10px; cursor: pointer;
+  padding: 10px; border-radius: 8px;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+  transition: all 0.18s;
+}
+.toggle-row:hover { border-color: var(--border-hi); background: rgba(99,179,237,0.05); }
+.toggle-row input { display: none; }
+.toggle-ui {
+  width: 32px; height: 18px; flex-shrink: 0;
+  background: rgba(255,255,255,0.08); border-radius: 999px; position: relative;
+  transition: background 0.18s;
+}
+.toggle-ui::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: #dde4f0; transition: transform 0.18s;
+}
+.toggle-row input:checked + .toggle-ui { background: var(--accent2); }
+.toggle-row input:checked + .toggle-ui::after { transform: translateX(14px); }
+.toggle-label { display: flex; flex-direction: column; gap: 2px; font-size: 0.7rem; }
+.toggle-label strong { font-weight: 700; color: var(--text); }
+.toggle-label em { font-style: normal; color: var(--text-2); font-size: 0.6rem; line-height: 1.3; }
+
+/* ==== Bake buttons ==================================================== */
+.btn-bake {
+  padding: 12px; display: flex; align-items: center; justify-content: center; gap: 8px;
+  background: linear-gradient(135deg, var(--accent2), #ed8936);
+  border: none; border-radius: 8px; color: #0f1420;
+  font-size: 0.85rem; font-weight: 800; cursor: pointer;
+  box-shadow: 0 4px 18px rgba(246,173,85,0.28); transition: all 0.2s; width: 100%;
+  letter-spacing: 0.5px;
+}
+.btn-bake:hover { transform: translateY(-1px); box-shadow: 0 6px 22px rgba(246,173,85,0.38); }
+.btn-bake.xray {
+  background: linear-gradient(135deg, #9f7aea, var(--accent2));
+  box-shadow: 0 4px 18px rgba(159,122,234,0.32);
+}
+.btn-bake.working {
+  pointer-events: none;
+  animation: pulse 0.6s ease-in-out infinite;
+}
+.bake-icon { font-size: 0.7rem; line-height: 1; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+.btn-clear {
+  padding: 9px; border-radius: 8px; font-size: 0.75rem; font-weight: 600;
+  cursor: pointer; transition: all 0.18s;
+  border: 1px solid rgba(252,129,129,0.2); background: rgba(252,129,129,0.06);
+  color: var(--danger); text-align: center;
+}
+.btn-clear:hover { background: rgba(252,129,129,0.12); border-color: rgba(252,129,129,0.35); }
+
 .btn-export {
   padding: 12px; display: flex; align-items: center; justify-content: center; gap: 8px;
   background: linear-gradient(135deg, var(--accent), #4299e1);
@@ -158,8 +213,13 @@ body {
 .viewport {
   flex: 1; min-height: 0; position: relative; background: #05070a;
   border-bottom: 1px solid var(--border);
+  overflow: hidden;
 }
 #viewport-3d { position: absolute; inset: 0; }
+
+.viewport-3d.drag-hover {
+  outline: 2px dashed var(--accent); outline-offset: -8px;
+}
 
 .vp-empty {
   position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
@@ -179,9 +239,68 @@ body {
 }
 .vp-btn-icon:hover { color: var(--text); border-color: var(--border-hi); }
 
-/* Atlas */
+/* ==== Decal floating overlay ========================================= */
+#decal-box {
+  position: absolute;
+  top: 0; left: 0;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+  outline: 1.5px dashed rgba(246,173,85,0.85);
+  outline-offset: 2px;
+  box-shadow:
+    0 0 0 1px rgba(0,0,0,0.3),
+    0 8px 28px rgba(0,0,0,0.45);
+  z-index: 6;
+  will-change: transform, width, height, left, top, opacity;
+}
+#decal-box:active { cursor: grabbing; }
+#decal-img {
+  width: 100%; height: 100%; display: block;
+  pointer-events: none;
+  image-rendering: pixelated;
+  image-rendering: -moz-crisp-edges;
+  image-rendering: crisp-edges;
+}
+
+.decal-handle {
+  position: absolute;
+  width: 22px; height: 22px;
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: auto;
+  touch-action: none;
+  z-index: 2;
+}
+.decal-handle span {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--accent2);
+  border: 2px solid #0c1018;
+  box-shadow: 0 0 0 1px rgba(246,173,85,0.5);
+}
+.handle-scale {
+  right: -11px; bottom: -11px;
+  cursor: nwse-resize;
+}
+.handle-rot {
+  left: 50%; top: -28px;
+  transform: translateX(-50%);
+  cursor: grab;
+}
+.handle-rot::before {
+  content: ""; position: absolute;
+  top: 22px; left: 50%;
+  width: 1px; height: 8px;
+  background: rgba(246,173,85,0.6);
+  transform: translateX(-50%);
+}
+.handle-rot span {
+  background: var(--accent3);
+  box-shadow: 0 0 0 1px rgba(104,211,145,0.5);
+}
+
+/* ==== Atlas ========================================================== */
 .atlas {
-  height: 42%; min-height: 240px;
+  height: 30%; min-height: 180px;
   display: flex; flex-direction: column;
   background: var(--bg-panel);
 }
@@ -205,13 +324,8 @@ body {
     var(--bg);
   overflow: hidden;
 }
-.atlas-wrap.drag-hover {
-  outline: 2px dashed var(--accent); outline-offset: -8px;
-  background: rgba(99,179,237,0.06);
-}
 #atlas-canvas {
   display: block;
-  cursor: grab;
   image-rendering: pixelated;
   box-shadow: 0 0 0 1px var(--border), 0 14px 40px rgba(0,0,0,0.4);
 }
