@@ -49,6 +49,7 @@ const S = {
   userImgW: 0,
   userImgH: 0,
   userImgPixels: null,
+  decalTex: null,          // THREE.Texture of userImg (for live projection shader)
 
   // Screen-space decal state (viewport pixel coords)
   decal: null,   // { cx, cy, baseW, baseH, scale, rot, opacity }
@@ -56,10 +57,85 @@ const S = {
   // X-Ray mode (paint through model onto back faces too)
   xray: false,
 
+  // Live projection (second pass on each cube)
+  decalPassMeshes: [],     // THREE.Mesh[] sharing decalUniforms
+  decalUniforms: null,     // shared uniforms object
+
   // Drag state
   dragMode: null,          // 'move' | 'scale' | 'rotate'
   dragStart: null,
 };
+
+// Vertex shader for the live decal pass — just passes clip-space position
+const DECAL_VERT = /* glsl */`
+  varying vec4 vClip;
+  void main() {
+    vec4 clip = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    vClip = clip;
+    gl_Position = clip;
+  }
+`;
+
+// Fragment shader: projects the decal image onto the fragment in screen space.
+// fragPx comes from the fragment's clip-space position, and we test if it falls
+// inside the (possibly rotated) decal rectangle on screen.
+const DECAL_FRAG = /* glsl */`
+  precision mediump float;
+  uniform sampler2D uDecalMap;
+  uniform float uHasDecal;
+  uniform vec2 uCenterPx;
+  uniform vec2 uSizePx;
+  uniform float uRotRad;
+  uniform float uOpacity;
+  uniform vec2 uViewportPx;
+  varying vec4 vClip;
+
+  void main() {
+    if (uHasDecal < 0.5) discard;
+    if (vClip.w <= 0.0) discard;
+    vec2 ndc = vClip.xy / vClip.w;
+    vec2 fragPx = vec2(
+      (ndc.x * 0.5 + 0.5) * uViewportPx.x,
+      (1.0 - (ndc.y * 0.5 + 0.5)) * uViewportPx.y
+    );
+    vec2 local = fragPx - uCenterPx;
+    float c = cos(-uRotRad);
+    float s = sin(-uRotRad);
+    vec2 rotated = vec2(local.x * c - local.y * s, local.x * s + local.y * c);
+    vec2 uv = rotated / uSizePx + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) discard;
+    vec4 decal = texture2D(uDecalMap, vec2(uv.x, 1.0 - uv.y));
+    if (decal.a < 0.01) discard;
+    gl_FragColor = vec4(decal.rgb, decal.a * uOpacity);
+  }
+`;
+
+function makeDecalUniforms() {
+  return {
+    uDecalMap:    { value: null },
+    uHasDecal:    { value: 0 },
+    uCenterPx:    { value: new THREE.Vector2() },
+    uSizePx:      { value: new THREE.Vector2(1, 1) },
+    uRotRad:      { value: 0 },
+    uOpacity:     { value: 1 },
+    uViewportPx:  { value: new THREE.Vector2(1, 1) },
+  };
+}
+
+function makeDecalMaterial(uniforms, xray) {
+  return new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader: DECAL_VERT,
+    fragmentShader: DECAL_FRAG,
+    transparent: true,
+    depthTest: !xray,
+    depthWrite: false,
+    side: xray ? THREE.DoubleSide : THREE.FrontSide,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+  });
+}
 
 // ════════════════════════════════
 // INIT
@@ -130,8 +206,29 @@ function initThree() {
   (function loop() {
     requestAnimationFrame(loop);
     S.controls.update();
+    updateDecalUniforms();
     S.renderer.render(S.scene, S.camera);
   })();
+}
+
+function updateDecalUniforms() {
+  const u = S.decalUniforms;
+  if (!u) return;
+  const vp = S.renderer.domElement;
+  u.uViewportPx.value.set(vp.clientWidth, vp.clientHeight);
+  if (!S.decal || !S.decalTex) {
+    u.uHasDecal.value = 0;
+    return;
+  }
+  u.uHasDecal.value = 1;
+  u.uDecalMap.value = S.decalTex;
+  u.uCenterPx.value.set(S.decal.cx, S.decal.cy);
+  u.uSizePx.value.set(
+    S.decal.baseW * S.decal.scale,
+    S.decal.baseH * S.decal.scale
+  );
+  u.uRotRad.value = (S.decal.rot || 0) * Math.PI / 180;
+  u.uOpacity.value = S.decal.opacity;
 }
 
 // ════════════════════════════════
@@ -235,7 +332,12 @@ function buildModel() {
     m.geometry.dispose();
     if (m.material.map !== S.bakeTex) m.material.dispose();
   });
+  // Decal pass meshes share geometry with their base sibling (disposed above),
+  // so we only dispose the ShaderMaterial here.
+  S.decalPassMeshes.forEach(m => m.material.dispose());
   S.allMeshes = [];
+  S.decalPassMeshes = [];
+  S.decalUniforms = makeDecalUniforms();
   S.meshGroup = new THREE.Group();
 
   const pivotOf = {};
@@ -299,6 +401,14 @@ function buildModel() {
       const geom = buildCubeGeometry(rw, rh, rd, uvMap, S.texW, S.texH);
       const mesh = new THREE.Mesh(geom, sharedMat);
 
+      // Sibling mesh that renders ONLY the live decal projection on top of
+      // the main mesh. Shares geometry transform via being added to the same
+      // parent; uses a ShaderMaterial with shared uniforms so updating the
+      // decal state on a single uniform set animates every cube at once.
+      const decalMat = makeDecalMaterial(S.decalUniforms, S.xray);
+      const decalMesh = new THREE.Mesh(geom, decalMat);
+      decalMesh.renderOrder = 2;
+
       const cx = (ox + sx / 2) * SCALE;
       const cy = (oy + sy / 2) * SCALE;
       const cz = (oz + sz / 2) * SCALE;
@@ -318,14 +428,19 @@ function buildModel() {
           'ZYX'
         );
         mesh.position.set(cx - px, cy - py, cz - pz);
+        decalMesh.position.copy(mesh.position);
         pivGrp.add(mesh);
+        pivGrp.add(decalMesh);
         g.add(pivGrp);
       } else {
         mesh.position.set(cx - myPiv[0], cy - myPiv[1], cz - myPiv[2]);
+        decalMesh.position.copy(mesh.position);
         g.add(mesh);
+        g.add(decalMesh);
       }
 
       S.allMeshes.push(mesh);
+      S.decalPassMeshes.push(decalMesh);
     });
   });
 
@@ -823,6 +938,12 @@ function wireUi() {
   $('chk-xray').addEventListener('change', e => {
     S.xray = e.target.checked;
     $('btn-bake').classList.toggle('xray', S.xray);
+    // Update live-projection materials so preview behaves like the baked result
+    S.decalPassMeshes.forEach(m => {
+      m.material.depthTest = !S.xray;
+      m.material.side = S.xray ? THREE.DoubleSide : THREE.FrontSide;
+      m.material.needsUpdate = true;
+    });
   });
 
   // Bake + clear + export
@@ -843,6 +964,14 @@ function loadImage(file) {
     img.onload = () => {
       S.userImg = img;
       S.userImgPixels = null; // invalidate cache
+      // Replace live-projection texture
+      if (S.decalTex) S.decalTex.dispose();
+      S.decalTex = new THREE.Texture(img);
+      S.decalTex.colorSpace = THREE.SRGBColorSpace;
+      S.decalTex.magFilter = THREE.LinearFilter;
+      S.decalTex.minFilter = THREE.LinearFilter;
+      S.decalTex.generateMipmaps = false;
+      S.decalTex.needsUpdate = true;
       $('img-thumb').src = ev.target.result;
       $('img-preview').style.display = 'block';
       $('img-text').textContent = file.name;
