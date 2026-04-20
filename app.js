@@ -138,6 +138,7 @@ function parseGeo(data) {
   resizeBakeTexture(S.texW, S.texH);
   computeUvRects();
   buildModel();
+  if (S.userImg) autoFitSticker('cover');
   bake();
   drawAtlas();
 
@@ -189,9 +190,13 @@ function computeBBox(rects) {
 
 function buildModel() {
   if (S.meshGroup) S.scene.remove(S.meshGroup);
+  const disposedMats = new Set();
   S.allMeshes.forEach(m => {
     m.geometry.dispose();
-    if (m.material.map !== S.bakeTex) m.material.dispose();
+    if (m.material && !disposedMats.has(m.material)) {
+      m.material.dispose();
+      disposedMats.add(m.material);
+    }
   });
   S.allMeshes = [];
   S.meshGroup = new THREE.Group();
