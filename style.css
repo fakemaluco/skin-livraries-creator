@@ -258,6 +258,8 @@ body {
 #decal-img {
   width: 100%; height: 100%; display: block;
   pointer-events: none;
+  opacity: 0.22;
+  mix-blend-mode: screen;
   image-rendering: pixelated;
   image-rendering: -moz-crisp-edges;
   image-rendering: crisp-edges;
