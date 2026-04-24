@@ -259,31 +259,52 @@ function parseGeo(data) {
   toast(`${S.allMeshes.length} cubos carregados`);
 }
 
-// Expand Bedrock/Java "box UV" (single [u,v] offset) into per-face UV rects,
-// always using POSITIVE uv_size. Orientation handling happens in the cube
-// geometry builder (per-face TL/TR/BL/BR vertex assignment).
+// Expand a cube's UV definition (either Bedrock "box UV" [u,v] or per-face
+// {face: {uv, uv_size}}) into per-face atlas pixel rectangles.
 //
-// Layout on the atlas (no mirror):
-//   y=v            [  UP (W×D)   ][  DOWN (W×D)  ]
-//   y=v+D  [WEST(D×H)][NORTH(W×H)][ EAST(D×H)  ][ SOUTH(W×H) ]
-function expandBoxUv(cube) {
+// Coordinate convention (matches Blockbench / skinview3d, verified against
+// vanilla Steve skin):
+//   +X = east  (Steve's LEFT side of body)
+//   -X = west  (Steve's RIGHT side of body)
+//   +Y = up
+//   -Y = down
+//   +Z = south (the entity's FRONT — where the face with eyes is)
+//   -Z = north (the entity's BACK)
+//
+// Box UV atlas layout (unmirrored), with D, W, H = cube size on Z, X, Y axes:
+//   y=v:      [---- empty D×D ----][ UP     W×D ][ DOWN   W×D ][--empty--]
+//   y=v+D:    [ WEST  D×H          ][ SOUTH  W×H ][ EAST   D×H ][ NORTH  W×H ]
+//
+// The SOUTH slot (u+D, v+D) is where the entity's face/front art sits.
+function expandUvToFaces(cube) {
   const uv = cube.uv;
   if (!uv) return {};
-  if (!Array.isArray(uv)) return uv; // already per-face
 
-  const [u, v] = uv;
-  const [W, H, D] = cube.size || [1, 1, 1];
-  const out = {
-    up:    { uv: [u + D,         v],         uv_size: [W, D] },
-    down:  { uv: [u + D + W,     v],         uv_size: [W, D] },
-    west:  { uv: [u,             v + D],     uv_size: [D, H] },
-    north: { uv: [u + D,         v + D],     uv_size: [W, H] },
-    east:  { uv: [u + D + W,     v + D],     uv_size: [D, H] },
-    south: { uv: [u + 2 * D + W, v + D],     uv_size: [W, H] },
-  };
-  if (cube.mirror === true) {
-    // Mirrored cubes: swap east/west textures (the common convention)
-    const e = out.east; out.east = out.west; out.west = e;
+  if (Array.isArray(uv)) {
+    const [u, v] = uv;
+    const [W, H, D] = cube.size || [1, 1, 1];
+    const r = {
+      up:    { x1: u + D,          y1: v,       x2: u + D + W,        y2: v + D     },
+      down:  { x1: u + D + W,      y1: v,       x2: u + D + 2 * W,    y2: v + D     },
+      west:  { x1: u,              y1: v + D,   x2: u + D,            y2: v + D + H },
+      south: { x1: u + D,          y1: v + D,   x2: u + D + W,        y2: v + D + H },
+      east:  { x1: u + D + W,      y1: v + D,   x2: u + 2 * D + W,    y2: v + D + H },
+      north: { x1: u + 2 * D + W,  y1: v + D,   x2: u + 2 * D + 2 * W, y2: v + D + H },
+    };
+    if (cube.mirror === true) {
+      // Swap east/west UV rects (Bedrock/Blockbench mirror flag convention).
+      const e = r.east; r.east = r.west; r.west = e;
+    }
+    return r;
+  }
+
+  // Per-face UV — face keys map 1:1 to spatial directions (Java/Bedrock).
+  const out = {};
+  for (const [face, fd] of Object.entries(uv)) {
+    if (!fd || !fd.uv) continue;
+    const [ux, uy] = fd.uv;
+    const [uw, uh] = fd.uv_size || [0, 0];
+    out[face] = { x1: ux, y1: uy, x2: ux + uw, y2: uy + uh };
   }
   return out;
 }
@@ -292,21 +313,15 @@ function computeUvRects() {
   const rects = [];
   (S.geo.bones || []).forEach((bone, bi) => {
     (bone.cubes || []).forEach((cube, ci) => {
-      const uvMap = expandBoxUv(cube);
-      Object.entries(uvMap).forEach(([face, fd]) => {
-        if (!fd || !fd.uv) return;
-        const [ux, uy] = fd.uv;
-        const [uw, uh] = fd.uv_size || [1, 1];
-        rects.push({
-          x: Math.min(ux, ux + uw),
-          y: Math.min(uy, uy + uh),
-          w: Math.abs(uw),
-          h: Math.abs(uh),
-          face,
-          bone: bi,
-          cube: ci,
-        });
-      });
+      const faces = expandUvToFaces(cube);
+      for (const [face, r] of Object.entries(faces)) {
+        const x = Math.min(r.x1, r.x2);
+        const y = Math.min(r.y1, r.y2);
+        const w = Math.abs(r.x2 - r.x1);
+        const h = Math.abs(r.y2 - r.y1);
+        if (w === 0 || h === 0) continue;
+        rects.push({ x, y, w, h, face, bone: bi, cube: ci });
+      }
     });
   });
   S.uvRects = rects;
