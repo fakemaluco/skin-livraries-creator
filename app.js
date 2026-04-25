@@ -411,8 +411,8 @@ function buildModel() {
       const rh = (sy + inf * 2) * SCALE;
       const rd = (sz + inf * 2) * SCALE;
 
-      const uvMap = expandBoxUv(cube);
-      const geom = buildCubeGeometry(rw, rh, rd, uvMap, S.texW, S.texH);
+      const faces = expandUvToFaces(cube);
+      const geom = buildCubeGeometry(rw, rh, rd, faces, S.texW, S.texH);
       const mesh = new THREE.Mesh(geom, sharedMat);
 
       // Sibling mesh that renders ONLY the live decal projection on top of
@@ -468,82 +468,62 @@ function buildModel() {
   resetCam();
 }
 
-// Build a cube with explicit per-face vertices, normals, and UVs.
-// Each face stores 4 vertices ordered TL, TR, BL, BR in atlas space, with the
-// spatial-to-atlas mapping following Blockbench/Bedrock conventions:
+// Build a cube using three.js BoxGeometry, then assign per-face UVs.
+// Convention follows skinview3d (the reference Minecraft Three.js viewer):
 //
-//   NORTH (-Z, seen from -Z): U+ -> +X, V+ -> -Y
-//   SOUTH (+Z, seen from +Z): U+ -> -X, V+ -> -Y
-//   EAST  (+X, seen from +X): U+ -> -Z, V+ -> -Y
-//   WEST  (-X, seen from -X): U+ -> +Z, V+ -> -Y
-//   UP    (+Y, looking down): U+ -> +X, V+ -> -Z  (bottom-of-atlas edge meets NORTH top)
-//   DOWN  (-Y, looking down): U+ -> +X, V+ -> +Z  (DOWN flipped vs UP in Z)
-function buildCubeGeometry(w, h, d, uvMap, texW, texH) {
-  const hx = w / 2, hy = h / 2, hz = d / 2;
+//  Three.js BoxGeometry face order in the UV attribute: +X, -X, +Y, -Y, +Z, -Z
+//  Mapping to entity-space face names:
+//    +X = east   (entity-left side)
+//    -X = west   (entity-right side)
+//    +Y = up
+//    -Y = down
+//    +Z = south  (entity FRONT, the side with the face)
+//    -Z = north  (entity BACK)
+//
+//  Per face, BoxGeometry's 4 vertices are emitted in atlas-rect order
+//  [TL, TR, BL, BR]. For UP/DOWN/EAST/WEST/SOUTH/NORTH we assign UVs directly;
+//  the DOWN face is flipped vertically (TL/TR <-> BL/BR) to match the standard
+//  unfolded-net layout used by Blockbench / Bedrock geometry / Java skins.
+function buildCubeGeometry(w, h, d, faces, texW, texH) {
+  const geom = new THREE.BoxGeometry(w, h, d);
+  const uvAttr = geom.attributes.uv;
 
-  // For each face: 4 vertices ordered [TL, TR, BL, BR] of the atlas rect.
-  const FACE_VERTS = {
-    east:  [[ hx,  hy,  hz], [ hx,  hy, -hz], [ hx, -hy,  hz], [ hx, -hy, -hz]],
-    west:  [[-hx,  hy, -hz], [-hx,  hy,  hz], [-hx, -hy, -hz], [-hx, -hy,  hz]],
-    up:    [[-hx,  hy,  hz], [ hx,  hy,  hz], [-hx,  hy, -hz], [ hx,  hy, -hz]],
-    down:  [[-hx, -hy, -hz], [ hx, -hy, -hz], [-hx, -hy,  hz], [ hx, -hy,  hz]],
-    south: [[ hx,  hy,  hz], [-hx,  hy,  hz], [ hx, -hy,  hz], [-hx, -hy,  hz]],
-    north: [[-hx,  hy, -hz], [ hx,  hy, -hz], [-hx, -hy, -hz], [ hx, -hy, -hz]],
-  };
-  const FACE_NORMAL = {
-    east:  [1, 0, 0],
-    west:  [-1, 0, 0],
-    up:    [0, 1, 0],
-    down:  [0, -1, 0],
-    south: [0, 0, 1],
-    north: [0, 0, -1],
-  };
+  // BoxGeometry vertex slots, 4 per face, in this order:
+  // 0: +X (east), 1: -X (west), 2: +Y (up), 3: -Y (down), 4: +Z (south), 5: -Z (north)
+  const FACE_ORDER = ['east', 'west', 'up', 'down', 'south', 'north'];
 
-  const order = ['east', 'west', 'up', 'down', 'south', 'north'];
-  const positions = [];
-  const normals = [];
-  const uvs = [];
-  const indices = [];
-
-  order.forEach((face, fi) => {
-    const verts = FACE_VERTS[face];
-    const nrm = FACE_NORMAL[face];
-    verts.forEach(p => positions.push(p[0], p[1], p[2]));
-    for (let j = 0; j < 4; j++) normals.push(nrm[0], nrm[1], nrm[2]);
-
-    const fd = uvMap[face];
-    if (!fd || !fd.uv) {
-      for (let j = 0; j < 4; j++) uvs.push(0, 0);
-    } else {
-      const [ux, uy] = fd.uv;
-      const [uw, uh] = fd.uv_size || [0, 0];
-      // Normalize (handle possibly-negative sizes that might still leak in).
-      const x0 = Math.min(ux, ux + uw);
-      const x1 = Math.max(ux, ux + uw);
-      const y0 = Math.min(uy, uy + uh);
-      const y1 = Math.max(uy, uy + uh);
-      const uL = x0 / texW;
-      const uR = x1 / texW;
-      const vTop = 1 - y0 / texH;   // atlas top  (v larger)
-      const vBot = 1 - y1 / texH;   // atlas base (v smaller)
-      // TL, TR, BL, BR
-      uvs.push(uL, vTop);
-      uvs.push(uR, vTop);
-      uvs.push(uL, vBot);
-      uvs.push(uR, vBot);
+  for (let i = 0; i < 6; i++) {
+    const f = faces[FACE_ORDER[i]];
+    const base = i * 4;
+    if (!f) {
+      // No UV defined — collapse this face to a single texel (renders as
+      // whatever color sits at the atlas top-left).
+      for (let j = 0; j < 4; j++) uvAttr.setXY(base + j, 0, 0);
+      continue;
     }
-
-    // CCW triangles viewed from outside the cube:  TL -> BL -> BR, TL -> BR -> TR
-    const base = fi * 4;
-    indices.push(base + 0, base + 2, base + 3);
-    indices.push(base + 0, base + 3, base + 1);
-  });
-
-  const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  geom.setAttribute('normal',   new THREE.Float32BufferAttribute(normals,   3));
-  geom.setAttribute('uv',       new THREE.Float32BufferAttribute(uvs,       2));
-  geom.setIndex(indices);
+    const x1 = Math.min(f.x1, f.x2);
+    const x2 = Math.max(f.x1, f.x2);
+    const y1 = Math.min(f.y1, f.y2);
+    const y2 = Math.max(f.y1, f.y2);
+    const uL = x1 / texW;
+    const uR = x2 / texW;
+    const vT = 1 - y1 / texH;   // atlas TOP (smaller image-y, larger three.js V)
+    const vB = 1 - y2 / texH;   // atlas BOTTOM
+    // BoxGeometry vertex order per face: [TL, TR, BL, BR] in plane-UV space.
+    if (FACE_ORDER[i] === 'down') {
+      // DOWN face uses a vertically-flipped layout in Bedrock/skin atlases.
+      uvAttr.setXY(base + 0, uL, vB); // TL_uv -> atlas BL
+      uvAttr.setXY(base + 1, uR, vB); // TR_uv -> atlas BR
+      uvAttr.setXY(base + 2, uL, vT); // BL_uv -> atlas TL
+      uvAttr.setXY(base + 3, uR, vT); // BR_uv -> atlas TR
+    } else {
+      uvAttr.setXY(base + 0, uL, vT);
+      uvAttr.setXY(base + 1, uR, vT);
+      uvAttr.setXY(base + 2, uL, vB);
+      uvAttr.setXY(base + 3, uR, vB);
+    }
+  }
+  uvAttr.needsUpdate = true;
   return geom;
 }
 
